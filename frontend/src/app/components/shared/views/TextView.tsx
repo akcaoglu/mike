@@ -65,7 +65,7 @@ export function TextView({ doc, displayUrl, refetchKey, quotes, quoteFocusKey, q
     if (!activeQuote?.trim()) return;
     let active = true;
     void highlightQuote([el], activeQuote).then((found) => {
-      if (active && found) el.querySelector<HTMLElement>(".pdf-text-highlight")?.scrollIntoView({ block: "center" });
+      if (active && found) el.querySelector<HTMLElement>(".pdf-text-highlight")?.scrollIntoView?.({ block: "center" });
     });
     return () => { active = false; };
   }, [text, activeQuote, quoteFocusKey]);
