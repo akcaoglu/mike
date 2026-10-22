@@ -28,3 +28,14 @@ describe("TextView", () => {
     expect(await screen.findByRole("button", { name: "Retry" })).toBeTruthy();
   });
 });
+
+it("fetches updated bytes when refetchKey changes at an unchanged URL", async () => {
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(new Response("Original", { headers: { "Content-Type": "text/plain" } }))
+    .mockResolvedValueOnce(new Response("Revised", { headers: { "Content-Type": "text/plain" } }));
+  const { rerender } = render(<TextView doc={{ document_id: "doc" }} refetchKey="before" />);
+  await waitFor(() => expect(screen.getByText("Original")).toBeTruthy());
+  rerender(<TextView doc={{ document_id: "doc" }} refetchKey="after" />);
+  await waitFor(() => expect(screen.getByText("Revised")).toBeTruthy());
+  expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+});

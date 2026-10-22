@@ -346,7 +346,12 @@ export function PlaybookSources({
         {selected ? (
           <div className="flex min-h-0 flex-1 flex-col pb-4 pt-2 md:pb-5">
             {/\.(md|txt)$/i.test(selected.filename) ? (
-              <TextView doc={{ document_id: `playbook-source:${selected.id}` }} displayUrl={selected.url} rounded={false} />
+              <TextView
+                doc={{ document_id: `playbook-source:${selected.id}` }}
+                displayUrl={selected.url}
+                refetchKey={selected.id === IMPORTED_ID ? revision : undefined}
+                rounded={false}
+              />
             ) : selected.fileType === "pdf" ? (
               <PdfView
                 key={selected.id}
