@@ -1,10 +1,8 @@
--- Extend the supported direct-upload file types to UTF-8 Markdown and TXT.
--- Keep the upload manifest function and table constraint synchronized.
--- Both changes are transactional; all other upload limits remain unchanged.
-begin;
-
+-- Migration date: 2026-10-22
+-- Accept UTF-8 Markdown and plain-text documents on existing installations.
+-- The migration runner supplies the encompassing transaction and ledger row.
 alter table public.upload_session_files
-  drop constraint upload_session_files_file_type_check;
+  drop constraint if exists upload_session_files_file_type_check;
 
 alter table public.upload_session_files
   add constraint upload_session_files_file_type_check
@@ -207,5 +205,3 @@ begin
   );
 end;
 $$;
-
-commit;

@@ -832,11 +832,20 @@ export interface UserProfile extends RouterProfileLists {
     titleModel: string | null;
     tabularModel: string | null;
     memoryCuratorModel: string | null;
+    subagentModel: string | null;
+    subagentReasoning: NonNullable<Message["reasoning"]> | null;
     lastSelectedChatModel: string | null;
     lastSelectedReasoningLevel: NonNullable<Message["reasoning"]>;
     mfaOnLogin: boolean;
     legalResearchUs: boolean;
+    /**
+     * The deployment answers CourtListener lookups from its bulk index, so
+     * the connector is installed for everyone without a token.
+     */
+    courtlistenerBulkData?: boolean;
     quickActionsVisible: boolean;
+    /** Whether responses and subagents show the model, effort and tokens they used. */
+    responseDetailsVisible?: boolean;
     darkMode: boolean;
     projectMemoryDefault: boolean;
     apiKeyStatus: ApiKeyStatus;
@@ -956,10 +965,13 @@ export async function updateUserProfile(payload: {
     titleModel?: string | null;
     tabularModel?: string | null;
     memoryCuratorModel?: string | null;
+    subagentModel?: string | null;
+    subagentReasoning?: NonNullable<Message["reasoning"]> | null;
     lastSelectedChatModel?: string | null;
     lastSelectedReasoningLevel?: NonNullable<Message["reasoning"]>;
     legalResearchUs?: boolean;
     quickActionsVisible?: boolean;
+    responseDetailsVisible?: boolean;
     darkMode?: boolean;
     projectMemoryDefault?: boolean;
 } & Partial<RouterProfileLists>): Promise<UserProfile> {
@@ -1059,6 +1071,38 @@ export async function updateResponseStyle(
     });
 }
 
+/** Mirrors backend/src/lib/webSearch/settings.ts. */
+export const WEB_SEARCH_BACKENDS = ["brave", "tavily", "deepseek"] as const;
+
+export type WebSearchBackend = (typeof WEB_SEARCH_BACKENDS)[number];
+
+export type ProviderFamilyChoice = "provider" | WebSearchBackend | "off";
+
+export type OtherFamilyChoice = WebSearchBackend | "off";
+
+export type WebSearchSettings = {
+    enabled: boolean;
+    claude: ProviderFamilyChoice;
+    openai: ProviderFamilyChoice;
+    other: OtherFamilyChoice;
+};
+
+export async function getWebSearchSettings(
+    signal?: AbortSignal,
+): Promise<WebSearchSettings> {
+    return apiRequest<WebSearchSettings>("/user/web-search", { signal });
+}
+
+export async function updateWebSearchSettings(
+    update: Partial<WebSearchSettings>,
+): Promise<WebSearchSettings> {
+    return apiRequest<WebSearchSettings>("/user/web-search", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(update),
+    });
+}
+
 export async function completeUserOnboarding(
     payload: PersonalisationDetails = {},
 ): Promise<UserProfile> {
@@ -1099,7 +1143,8 @@ export type ApiKeyProvider =
     | "vertex"
     | "xai"
     | "custom"
-    | "courtlistener";
+    | "courtlistener"
+    | WebSearchBackend;
 /**
  * Whose key a provider runs on: the person's own, their organization's, or
  * the deployment's. "org" only ever appears in an organization's status.
@@ -1728,7 +1773,12 @@ export async function deleteOrg(orgId: string): Promise<void> {
     await apiRequest(`/orgs/${orgId}`, { method: "DELETE" });
 }
 
-export type OrgDataKind = "chats" | "tabular-reviews" | "projects" | "memories";
+export type OrgDataKind =
+    | "chats"
+    | "tabular-reviews"
+    | "projects"
+    | "memories"
+    | "playbooks";
 
 /** Permanently deletes one kind of content across an organization. Owner only. */
 export async function deleteOrgData(
@@ -3989,7 +4039,6 @@ export interface PlaybookTopic {
 export interface PlaybookContent {
     name: string;
     description: string;
-    globalGuidance: string;
     representedParty: string;
     documentTypes: string[];
     jurisdictions: string[];
@@ -4044,6 +4093,8 @@ export interface PlaybookFinding {
     /** The tracked change made in the reviewed Word document, if any. */
     edit?: EditAnnotation | null;
 }
+export type PlaybookReviewScope = "full" | "issues";
+
 export interface PlaybookRun {
     id: string;
     playbookId: string;
@@ -4054,6 +4105,8 @@ export interface PlaybookRun {
     /** The version holding the review's tracked changes, if it made any. */
     editedVersionId?: string | null;
     reviewMode: "strict" | "permissive";
+    /** "issues" reported only what needs attention. Absent on older runs. */
+    reviewScope?: PlaybookReviewScope;
     status: string;
     summary: string | null;
     findings: PlaybookFinding[];
@@ -4086,7 +4139,7 @@ export async function getPlaybook(playbookId: string): Promise<Playbook> {
     return apiRequest(`/playbooks/${encodeURIComponent(playbookId)}`);
 }
 
-/** The Word file a playbook was imported from, streamed for the viewer. */
+/** The Word or PDF file a playbook was imported from, streamed for the viewer. */
 export function getPlaybookSourceUrl(playbookId: string): string {
     return `${API_BASE}/playbooks/${encodeURIComponent(playbookId)}/source`;
 }
@@ -4180,7 +4233,8 @@ export type NewPlaybookDetails = Partial<
         | "representedParty"
         | "documentTypes"
         | "jurisdictions"
-    >
+    > &
+        Pick<Playbook, "visibility">
 >;
 
 export async function createPlaybook(
@@ -4199,18 +4253,49 @@ export async function createPlaybook(
     });
 }
 
+/** An import compiling on the server, which the page follows by polling. */
+export interface PlaybookImport {
+    id: string;
+    status: "running" | "completed" | "failed";
+    stage: string;
+    error: string | null;
+    filename: string;
+    name: string | null;
+    /** The playbook being replaced, or the one created once completed. */
+    playbookId: string | null;
+    startedAt: string;
+    completedAt: string | null;
+}
+
 /**
- * The source .docx goes straight to object storage under a signed URL, then
- * the API compiles it from that key. The API never receives the file body.
+ * Starts compiling a playbook and returns the running import at once; the
+ * compile continues on the server whether or not the page stays open. An
+ * upload goes straight to object storage under a signed URL, then the API
+ * compiles it from that key, so the API never receives the file body.
  */
-export async function importPlaybook(
-    file: File,
+export async function startPlaybookImport(
+    /** An upload, or a document already in the caller's files. */
+    source: File | { documentId: string },
     model: string,
     name?: string,
     /** Replace this playbook's content rather than create a new playbook. */
     playbookId?: string,
     workspace?: string | null,
-): Promise<Playbook> {
+): Promise<PlaybookImport> {
+    const options = {
+        model,
+        ...(name?.trim() ? { name: name.trim() } : {}),
+        ...(playbookId ? { playbookId } : {}),
+        ...(workspace ? { workspace } : {}),
+    };
+    if (!(source instanceof File)) {
+        return apiRequest<PlaybookImport>("/playbooks/import", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ documentId: source.documentId, ...options }),
+        });
+    }
+    const file = source;
     const staged = await apiRequest<{
         uploadUrl: string;
         storageKey: string;
@@ -4230,18 +4315,30 @@ export async function importPlaybook(
         throw new Error("The playbook could not be uploaded. Please try again.");
     }
 
-    return apiRequest<Playbook>("/playbooks/import", {
+    return apiRequest<PlaybookImport>("/playbooks/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             storageKey: staged.storageKey,
             filename: file.name,
-            model,
-            ...(name?.trim() ? { name: name.trim() } : {}),
-            ...(playbookId ? { playbookId } : {}),
-            ...(workspace ? { workspace } : {}),
+            ...options,
         }),
     });
+}
+
+export async function getPlaybookImport(
+    importId: string,
+): Promise<PlaybookImport> {
+    return apiRequest(`/playbooks/imports/${encodeURIComponent(importId)}`);
+}
+
+/** The caller's imports still compiling in the workspace. */
+export async function listRunningPlaybookImports(
+    workspace?: string | null,
+): Promise<PlaybookImport[]> {
+    return apiRequest(
+        `/playbooks/imports${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ""}`,
+    );
 }
 
 export async function updatePlaybook(
@@ -4301,6 +4398,10 @@ export async function revokePlaybookShare(
     );
 }
 
+/**
+ * Starts a review. It runs on the server apart from this request, so the run
+ * comes back still running; its status says when it has finished.
+ */
 export async function reviewDocumentWithPlaybook(
     playbookId: string,
     payload: {
@@ -4312,6 +4413,7 @@ export async function reviewDocumentWithPlaybook(
         instructions?: string;
         model: string;
         reviewMode: "strict" | "permissive";
+        reviewScope?: PlaybookReviewScope;
     },
 ): Promise<PlaybookRun> {
     return apiRequest(`/playbooks/${encodeURIComponent(playbookId)}/review`, {
@@ -4338,6 +4440,58 @@ export async function listAllPlaybookRuns(
         ? `?workspace=${encodeURIComponent(workspace)}`
         : "";
     return apiRequest(`/playbooks/runs${query}`);
+}
+
+/** Deletes one of the caller's runs; one still running is refused. */
+export async function deletePlaybookRun(runId: string): Promise<void> {
+    return apiRequest(`/playbooks/runs/${encodeURIComponent(runId)}`, {
+        method: "DELETE",
+    });
+}
+
+/** A run as the sidebar's History lists it. */
+export interface PlaybookRunHistoryItem {
+    id: string;
+    playbookId: string;
+    playbookName: string;
+    documentName: string | null;
+    status: string;
+    error: string | null;
+    startedAt: string;
+    completedAt: string | null;
+}
+
+/** A page of the caller's runs, newest first, for the sidebar's History. */
+export async function listPlaybookRunHistory(options: {
+    workspace?: string | null;
+    /** The `startedAt` of the last run already read. */
+    before?: string;
+    limit?: number;
+    signal?: AbortSignal;
+}): Promise<PlaybookRunHistoryItem[]> {
+    const params = new URLSearchParams();
+    if (options.workspace) params.set("workspace", options.workspace);
+    if (options.before) params.set("before", options.before);
+    if (options.limit) params.set("limit", String(options.limit));
+    const query = params.toString();
+    return apiRequest(`/playbooks/runs/history${query ? `?${query}` : ""}`, {
+        signal: options.signal,
+    });
+}
+
+export interface PlaybookRunStatus {
+    id: string;
+    status: string;
+    completedAt: string | null;
+}
+
+/** Small status snapshots of the caller's runs, for polling running ones. */
+export async function getPlaybookRunStatuses(
+    ids: string[],
+    signal?: AbortSignal,
+): Promise<PlaybookRunStatus[]> {
+    const params = new URLSearchParams({ ids: ids.join(",") });
+    return apiRequest(`/playbooks/runs/status?${params}`, { signal });
 }
 
 export async function deletePlaybook(playbookId: string): Promise<void> {

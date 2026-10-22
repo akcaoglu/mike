@@ -10,7 +10,10 @@
 // vocabulary does not carry.
 
 import type { Db } from "../../lib/supabase";
-import { getCourtlistenerCaseOpinions } from "../../lib/courtlistener";
+import {
+  COURTLISTENER_TOKEN_REQUIRED_MESSAGE,
+  getCourtlistenerCaseOpinions,
+} from "../../lib/courtlistener";
 import { getUserModelSettings } from "../user/user.service";
 import {
   caseClusterId,
@@ -31,12 +34,12 @@ export type SourceDocumentResult =
 // when CourtListener refuses the one it was given; only those markers are read,
 // never the upstream body, which echoes the rejected token back.
 export const COURTLISTENER_CREDENTIAL_DETAIL =
-  "CourtListener rejected the configured API token. Check it in Settings.";
+  "CourtListener rejected the configured API token. Check it in Settings → Connectors.";
 
 function isCourtlistenerCredentialError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : "";
   return (
-    message.includes("COURTLISTENER_API_TOKEN must be set") ||
+    message === COURTLISTENER_TOKEN_REQUIRED_MESSAGE ||
     message.startsWith("CourtListener error (401") ||
     message.startsWith("CourtListener error (403")
   );

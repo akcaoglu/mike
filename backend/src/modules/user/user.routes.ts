@@ -1,4 +1,4 @@
-import { GoogleWorkspaceError, startWorkspaceOAuth, completeWorkspaceOAuth, cancelWorkspaceOAuth, disconnectWorkspace, updateWorkspaceSettings, setWorkspaceToolEnabled } from "../../lib/integrations/googleWorkspaceAuth";
+import { GoogleWorkspaceError, GoogleWorkspaceUnavailableError, assertWorkspaceProviderAvailable, startWorkspaceOAuth, completeWorkspaceOAuth, cancelWorkspaceOAuth, disconnectWorkspace, updateWorkspaceSettings, setWorkspaceToolEnabled } from "../../lib/integrations/googleWorkspaceAuth";
 import { workspaceConnectorStatus, workspaceToolList } from "../../lib/integrations/googleWorkspace";
 // HTTP layer for the user module. Handlers parse params/query/body, call the
 // service functions behind user.service.ts, and map their typed results onto
@@ -13,6 +13,7 @@ import {
     createGoogleDrivePickerSession,
     disconnectGoogleDrive,
     GoogleDrivePickerUnavailableError,
+    GoogleDriveUnavailableError,
     getGoogleDriveStatus,
     setGoogleDriveToolEnabled,
     startGoogleDriveOAuth,
@@ -40,6 +41,7 @@ import {
 } from "../../lib/orgs";
 import { sendOrgFailure } from "../../lib/orgFailure";
 import { configuredApiPublicUrl } from "../../lib/runtimeConfig";
+import { isWebSearchBackend } from "../../lib/webSearch";
 import {
     setUserProfilePhoto,
     bootstrapUserProfile,
@@ -80,6 +82,9 @@ import {
     saveCustomInstructions,
     validateResponseStylePayload,
     saveResponseStyle,
+    getWebSearchSettings,
+    validateWebSearchPayload,
+    saveWebSearchSettings,
 } from "./user.service";
 
 export const userRouter = Router();
@@ -356,6 +361,31 @@ userRouter.put("/response-style", requireAuth, asyncRoute(async (req, res) => {
     res.json(result.data);
 }));
 
+// GET /user/web-search
+userRouter.get("/web-search", requireAuth, asyncRoute(async (_req, res) => {
+    const userId = res.locals.userId as string;
+    const result = await getWebSearchSettings(createServerSupabase(), userId);
+    if (!result.ok) return void sendServiceFailure(res, result);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json(result.data);
+}));
+
+// PUT /user/web-search
+userRouter.put("/web-search", requireAuth, asyncRoute(async (req, res) => {
+    const parsed = validateWebSearchPayload(req.body);
+    if (!parsed.ok) return void res.status(400).json({ detail: parsed.detail });
+
+    const userId = res.locals.userId as string;
+    const result = await saveWebSearchSettings(
+        createServerSupabase(),
+        userId,
+        parsed.update,
+    );
+    if (!result.ok) return void sendServiceFailure(res, result);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json(result.data);
+}));
+
 // POST /user/onboarding
 userRouter.post("/onboarding", requireAuth, asyncRoute(async (req, res) => {
     const parsed = validateOnboardingPayload(req.body);
@@ -455,7 +485,12 @@ userRouter.patch(
     requireMfaIfEnrolled,
     asyncRoute(async (req, res) => {
         const provider = normalizeApiKeyProvider(req.params.provider);
-        if (!provider || provider === "courtlistener" || typeof req.body?.enabled !== "boolean") {
+        if (
+            !provider ||
+            provider === "courtlistener" ||
+            isWebSearchBackend(provider) ||
+            typeof req.body?.enabled !== "boolean"
+        ) {
             return void res.status(400).json({ detail: "A supported provider and boolean enabled value are required." });
         }
         const result = await setApiKeyEnabled(
@@ -758,6 +793,12 @@ userRouter.post(
             );
             res.json(result);
         } catch (err) {
+            // A service the operator switched off is not a setup problem
+            // the user can fix: say so, with no consent URL to open.
+            if (err instanceof GoogleDriveUnavailableError)
+                return void res
+                    .status(404)
+                    .json({ code: err.code, detail: err.message });
             console.error("[google-drive] oauth start failed", {
                 userId,
                 error: safeError(err),
@@ -888,12 +929,13 @@ userRouter.post(
                 ),
             );
         } catch (err) {
-            // Repo-authored messages: not set up (404), or not connected,
-            // turned off or revoked (409).
+            // Repo-authored messages: not set up or switched off by the
+            // operator (404), or not connected, turned off or revoked (409).
             if (err instanceof GoogleDriveUserError) {
                 return void res
                     .status(
-                        err instanceof GoogleDrivePickerUnavailableError
+                        err instanceof GoogleDrivePickerUnavailableError ||
+                            err instanceof GoogleDriveUnavailableError
                             ? 404
                             : 409,
                     )
@@ -1054,6 +1096,7 @@ for (const provider of ["gmail", "google-calendar"] as const) {
         requireMfaIfEnrolled,
         asyncRoute(async (req, res) => {
             try {
+                assertWorkspaceProviderAvailable(provider);
                 res.json(
                     await startWorkspaceOAuth(
                         createServerSupabase(),
@@ -1063,6 +1106,12 @@ for (const provider of ["gmail", "google-calendar"] as const) {
                     ),
                 );
             } catch (error) {
+                // A service the operator switched off is not a setup problem
+                // the user can fix: say so, with no consent URL to open.
+                if (error instanceof GoogleWorkspaceUnavailableError)
+                    return void res
+                        .status(404)
+                        .json({ code: "connector_unavailable", detail: error.message });
                 // As for Slack and Drive: only repo-authored setup steps reach
                 // the browser verbatim, under their machine-readable code.
                 if (error instanceof ConnectorSetupError) {

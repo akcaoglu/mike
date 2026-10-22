@@ -15,6 +15,7 @@ import {
     normalizeCustomBaseUrl,
     normalizeVertexLocation,
 } from "../../lib/llm/cloudProviders";
+import { WEB_SEARCH_BACKENDS, type WebSearchBackend } from "../../lib/webSearch";
 
 export type ApiKeyProvider =
     | "claude"
@@ -30,7 +31,8 @@ export type ApiKeyProvider =
     | "vertex"
     | "xai"
     | "custom"
-    | "courtlistener";
+    | "courtlistener"
+    | WebSearchBackend;
 export type ApiKeySource = "user" | "org" | "env" | null;
 
 /**
@@ -92,6 +94,7 @@ const PROVIDERS: ApiKeyProvider[] = [
     "xai",
     "custom",
     "courtlistener",
+    ...WEB_SEARCH_BACKENDS,
 ];
 
 const SETTINGS_PROVIDERS: readonly SettingsApiKeyProvider[] = [
@@ -181,8 +184,16 @@ function envApiKey(provider: ApiKeyProvider): string | null {
         // shared endpoints in MIKE_MODEL_CONFIG_JSON.
         case "custom":
             return null;
+        // CourtListener is a connector: each user (or their organization)
+        // saves its own token, as with every other connection.
         case "courtlistener":
-            return process.env.COURTLISTENER_API_TOKEN?.trim() || null;
+            return null;
+        case "brave":
+            return process.env.BRAVE_SEARCH_API_KEY?.trim() || null;
+        case "tavily":
+            return process.env.TAVILY_API_KEY?.trim() || null;
+        case "deepseek":
+            return process.env.DEEPSEEK_SEARCH_API_KEY?.trim() || null;
         default:
             return null;
     }
@@ -336,6 +347,9 @@ function envApiKeyStatus(): ApiKeyStatus {
         xai: false,
         custom: false,
         courtlistener: false,
+        brave: false,
+        tavily: false,
+        deepseek: false,
         sources: {
             claude: null,
             gemini: null,
@@ -351,6 +365,9 @@ function envApiKeyStatus(): ApiKeyStatus {
             xai: null,
             custom: null,
             courtlistener: null,
+            brave: null,
+            tavily: null,
+            deepseek: null,
         },
         settings: {},
         enabled: {},
@@ -418,6 +435,9 @@ function envApiKeys(): UserApiKeys {
         xai: envApiKey("xai"),
         custom: envApiKey("custom"),
         courtlistener: envApiKey("courtlistener"),
+        brave: envApiKey("brave"),
+        tavily: envApiKey("tavily"),
+        deepseek: envApiKey("deepseek"),
     };
     const envBedrock = envBedrockCredentials();
     const envAzure = envAzureCredentials();

@@ -18,6 +18,7 @@ import { ConfirmPopup } from "@/app/components/popups/ConfirmPopup";
 import { FileTypeIcon } from "@/app/components/shared/FileTypeIcon";
 import { DocumentPaneTitle } from "@/app/components/shared/DocumentPaneTitle";
 import { PdfView } from "@/app/components/shared/views/PdfView";
+import { TextView } from "@/app/components/shared/views/TextView";
 import { DocxView } from "@/app/components/shared/views/DocxView";
 import { SpreadsheetView } from "@/app/components/shared/views/SpreadsheetView";
 import { CloseButton } from "@/shared/ui/CloseButton";
@@ -613,6 +614,8 @@ export function DocumentSidePanel({
                                 versionId={selectedVersionId}
                                 displayUrl={displayUrl}
                             />
+                        ) : selectedViewType === "text" ? (
+                            <TextView key={`${selectedVersionId ?? "current"}:${selectedUploadedAt ?? ""}:${selectedSizeBytes ?? ""}`} rounded="top-right" doc={{ document_id: doc.id, version_id: selectedVersionId }} displayUrl={displayUrl} />
                         ) : (
                             <PdfView
                                 rounded="top-right"

@@ -2,12 +2,18 @@ import { createServerSupabase, type Db } from "../../lib/supabase";
 import { type UserApiKeys } from "../../lib/llm";
 import { type ReasoningLevel } from "../../lib/llm";
 import { getEffectiveApiKeys } from "./user.apiKeyStore";
+import { courtlistenerBulkDataEnabled } from "../../lib/courtlistener";
 import { loadCustomInstructions } from "./user.customInstructions";
 import {
     DEFAULT_RESPONSE_STYLE,
     loadResponseStyle,
     type ResponseStyle,
 } from "./user.responseStyle";
+import { loadWebSearchSettings } from "./user.webSearch";
+import {
+    DEFAULT_WEB_SEARCH_SETTINGS,
+    type WebSearchSettings,
+} from "../../lib/webSearch";
 import { safeError } from "../../lib/safeError";
 import { getEffectiveRouterModels } from "../../lib/routerModels";
 import {
@@ -22,11 +28,20 @@ export type UserModelSettings = {
     tabular_model: string | null;
     /** Explicit override for asynchronous memory curation. */
     memory_curator_model: string | null;
+    /** Told to the assistant as defaults for its subagents; never enforced. */
+    subagent_model: string | null;
+    subagent_reasoning: ReasoningLevel | null;
     /** Cross-surface fallback used only when a chat has no usable model. */
     last_selected_chat_model: string | null;
     /** Cross-surface fallback used only when a chat has no saved level. */
     last_selected_reasoning_level: ReasoningLevel | null;
+    /**
+     * Whether the assistant gets the CourtListener tools: the user's switch is
+     * on and the connector is usable, through a saved token or the
+     * deployment's bulk index.
+     */
     legal_research_us: boolean;
+    web_search: WebSearchSettings;
     api_keys: UserApiKeys;
     personalisation?: {
         displayName: string | null;
@@ -62,11 +77,12 @@ export async function getUserModelSettings(
         routerModels,
         customInstructions,
         responseStyle,
+        webSearch,
     ] = await Promise.all([
         client
             .from("user_profiles")
             .select(
-                "title_model, tabular_model, memory_curator_model, last_selected_chat_model, last_selected_reasoning_level, legal_research_us, display_name, organisation, jurisdiction, practice_setting, professional_title, practice_areas",
+                "title_model, tabular_model, memory_curator_model, subagent_model, subagent_reasoning, last_selected_chat_model, last_selected_reasoning_level, legal_research_us, display_name, organisation, jurisdiction, practice_setting, professional_title, practice_areas",
             )
             .eq("user_id", userId)
             .single(),
@@ -87,9 +103,41 @@ export async function getUserModelSettings(
             );
             return DEFAULT_RESPONSE_STYLE;
         }),
+        loadWebSearchSettings(client, userId).catch((error: unknown) => {
+            console.error(
+                "[user-settings] web search settings load failed",
+                safeError(error),
+            );
+            return DEFAULT_WEB_SEARCH_SETTINGS;
+        }),
     ]);
     let data = profileResult.data;
     let profileError = profileResult.error;
+
+    // Deploy-before-migrate tolerance for the subagent defaults.
+    if (
+        profileError?.code === "42703" &&
+        typeof profileError.message === "string" &&
+        profileError.message.includes("subagent_")
+    ) {
+        const withoutSubagentDefaults = await client
+            .from("user_profiles")
+            .select(
+                "title_model, tabular_model, memory_curator_model, last_selected_chat_model, last_selected_reasoning_level, legal_research_us, display_name, organisation, jurisdiction, practice_setting, professional_title, practice_areas",
+            )
+            .eq("user_id", userId)
+            .single();
+        if (!withoutSubagentDefaults.error) {
+            data = {
+                ...withoutSubagentDefaults.data,
+                subagent_model: null,
+                subagent_reasoning: null,
+            } as typeof data;
+            profileError = null;
+        } else {
+            profileError = withoutSubagentDefaults.error;
+        }
+    }
 
     // Deploy-before-migrate tolerance for the memory curator preference. Keep
     // every previously available setting while the new nullable column is
@@ -170,6 +218,11 @@ export async function getUserModelSettings(
             data?.memory_curator_model,
             routerModels,
         ),
+        subagent_model: normalizeOptionalModelPreference(
+            data?.subagent_model,
+            routerModels,
+        ),
+        subagent_reasoning: normalizeReasoningLevel(data?.subagent_reasoning),
         last_selected_chat_model: normalizeOptionalModelPreference(
             data?.last_selected_chat_model,
             routerModels,
@@ -179,7 +232,9 @@ export async function getUserModelSettings(
         ),
         legal_research_us:
             (data as { legal_research_us?: boolean | null } | null)
-                ?.legal_research_us !== false,
+                ?.legal_research_us !== false &&
+            (!!api_keys.courtlistener || courtlistenerBulkDataEnabled()),
+        web_search: webSearch,
         personalisation: {
             displayName:
                 typeof data?.display_name === "string"

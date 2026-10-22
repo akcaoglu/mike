@@ -11,6 +11,10 @@ import {
   stateHash,
 } from "../mcp/client";
 import { googleDriveOAuthEnv } from "./googleDrive";
+import {
+  googleServiceUnavailableMessage,
+  isGoogleServiceAvailable,
+} from "./googleAvailability";
 import { ConnectorSetupError } from "../mcp/errors";
 import { googleDriveRequest } from "./googleDriveHttp";
 import {
@@ -36,6 +40,18 @@ export const GOOGLE_PROVIDERS = {
   },
 } as const;
 export class GoogleWorkspaceError extends Error {}
+/** The operator has switched this service off for the whole deployment. */
+export class GoogleWorkspaceUnavailableError extends GoogleWorkspaceError {}
+/** See GOOGLE_WORKSPACE_DISABLED_PROVIDERS in ./googleAvailability. */
+export function isWorkspaceProviderAvailable(provider: GoogleProvider): boolean {
+  return isGoogleServiceAvailable(provider);
+}
+export function assertWorkspaceProviderAvailable(provider: GoogleProvider): void {
+  if (!isWorkspaceProviderAvailable(provider))
+    throw new GoogleWorkspaceUnavailableError(
+      googleServiceUnavailableMessage(provider),
+    );
+}
 export function googleWorkspaceSetupInstructions(
   provider: GoogleProvider,
   redirectUri: string,
@@ -158,6 +174,7 @@ export async function workspaceStatus(
     if (error) throw error;
     return {
       configured,
+      available: isWorkspaceProviderAvailable(provider),
       schemaReady: true,
       connected: !!row,
       writeEnabled: row?.write_enabled === true,
@@ -172,6 +189,7 @@ export async function workspaceStatus(
     if (code === "PGRST205" || code === "42P01")
       return {
         configured,
+        available: isWorkspaceProviderAvailable(provider),
         schemaReady: false,
         connected: false,
         writeEnabled: false,
