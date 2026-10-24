@@ -16,6 +16,11 @@ import {
     normalizeVertexLocation,
 } from "../../lib/llm/cloudProviders";
 import { WEB_SEARCH_BACKENDS, type WebSearchBackend } from "../../lib/webSearch";
+import {
+    type ConnectorOwner,
+    personalConnectorOwner,
+    workspaceFilter,
+} from "../../lib/connectorOwner";
 
 export type ApiKeyProvider =
     | "claude"
@@ -284,6 +289,11 @@ export async function getApiKeyStatusFor(
 ): Promise<ApiKeyStatus> {
     const status = envApiKeyStatus();
     overlayStatusRows(status, await loadStatusRows(owner, db), owner.kind);
+    if (owner.kind === "user")
+        overlayCourtListenerStatus(
+            status,
+            await readCourtListenerConnection(personalConnectorOwner(owner.id), db),
+        );
     return status;
 }
 
@@ -298,15 +308,13 @@ export async function getEffectiveApiKeyStatus(
     orgId: string,
     db: Db = createServerSupabase(),
 ): Promise<ApiKeyStatus> {
-    const scope = await loadOrgKeyScope(userId, orgId, db);
-    if (!scope) return getUserApiKeyStatus(userId, db);
+    if (!(await isOrgMember(userId, orgId, db)))
+        return getUserApiKeyStatus(userId, db);
     const status = envApiKeyStatus();
-    if (scope.allowPersonal)
-        overlayStatusRows(
-            status,
-            await loadStatusRows(userKeyOwner(userId), db),
-            "user",
-        );
+    overlayCourtListenerStatus(
+        status,
+        await readCourtListenerConnection({ userId, orgId }, db),
+    );
     overlayStatusRows(
         status,
         await loadStatusRows(orgKeyOwner(orgId), db),
@@ -475,7 +483,7 @@ async function loadKeyRows(
 // direct connection reports a missing table or column as 42P01 / 42703;
 // PostgREST reports one missing from its schema cache as PGRST205 /
 // PGRST204. Until the migration lands an organization simply has no keys of
-// its own and every member runs on theirs, exactly as before it.
+// its own.
 function isMissingOrgKeySchema(error: unknown): boolean {
     const code = (error as { code?: unknown } | null)?.code;
     return (
@@ -487,40 +495,23 @@ function isMissingOrgKeySchema(error: unknown): boolean {
 }
 
 /**
- * How an organization's keys apply to one person: null when they do not —
- * the person is not a member, or the organization is gone — and otherwise
- * whether their own keys may sit beneath the organization's.
+ * Whether an organization's keys apply to one person: not when they are not
+ * a member, or the organization is gone.
  */
-async function loadOrgKeyScope(
+async function isOrgMember(
     userId: string,
     orgId: string,
     db: Db,
-): Promise<{ allowPersonal: boolean } | null> {
-    const [membership, organization] = await Promise.all([
-        db
-            .from("org_members")
-            .select("org_id, organizations!inner(id)")
-            .is("organizations.deleted_at", null)
-            .eq("org_id", orgId)
-            .eq("user_id", userId)
-            .maybeSingle(),
-        db
-            .from("organizations")
-            .select("allow_personal_api_keys")
-            .eq("id", orgId)
-            .maybeSingle(),
-    ]);
-    if (membership.error) throw membership.error;
-    if (organization.error) {
-        if (isMissingOrgKeySchema(organization.error)) return null;
-        throw organization.error;
-    }
-    if (!membership.data || !organization.data) return null;
-    return {
-        allowPersonal:
-            (organization.data as { allow_personal_api_keys?: boolean })
-                .allow_personal_api_keys !== false,
-    };
+): Promise<boolean> {
+    const { data, error } = await db
+        .from("org_members")
+        .select("org_id, organizations!inner(id)")
+        .is("organizations.deleted_at", null)
+        .eq("org_id", orgId)
+        .eq("user_id", userId)
+        .maybeSingle();
+    if (error) throw error;
+    return !!data;
 }
 
 const without = <T,>(
@@ -596,6 +587,10 @@ export async function getUserApiKeys(
 ): Promise<UserApiKeys> {
     const apiKeys = envApiKeys();
     overlayKeyRows(apiKeys, await loadKeyRows(userKeyOwner(userId), db));
+    overlayCourtListenerKey(
+        apiKeys,
+        await readCourtListenerConnection(personalConnectorOwner(userId), db),
+    );
     return apiKeys;
 }
 
@@ -603,15 +598,12 @@ export async function getUserApiKeys(
  * The keys a piece of work runs on.
  *
  * Personal work (`orgId` null) runs on the caller's keys, as it always has.
- * Work inside an organization runs on the organization's key for a provider
- * when it has one — the firm pays for it, under the firm's terms with the
- * provider. For a provider it has none for, the organization decides:
- *
- *   allow_personal_api_keys = true   the member's own key, then the
- *                                    deployment's
- *   allow_personal_api_keys = false  the deployment's only; a member's
- *                                    personal key never touches the
- *                                    organization's work
+ * Work inside an organization runs only on centrally provided keys: the
+ * organization's key for a provider when it has one — the firm pays for it,
+ * under the firm's terms with the provider — and the deployment's
+ * otherwise. A member's own key never touches the organization's work. Their
+ * own CourtListener token for the organization still applies: it is a
+ * connector they set up in that workspace, not a model key.
  *
  * `orgId` comes from the content being worked on, which the caller has
  * already been authorised for. Membership is checked again here anyway: an
@@ -625,12 +617,16 @@ export async function getEffectiveApiKeys(
 ): Promise<UserApiKeys> {
     if (!orgId) return getUserApiKeys(userId, db);
 
-    const scope = await loadOrgKeyScope(userId, orgId, db);
-    if (!scope) return getUserApiKeys(userId, db);
+    if (!(await isOrgMember(userId, orgId, db)))
+        return getUserApiKeys(userId, db);
 
-    const apiKeys = scope.allowPersonal
-        ? await getUserApiKeys(userId, db)
-        : envApiKeys();
+    const apiKeys = envApiKeys();
+    // The member's own CourtListener token for this organization, never
+    // their Personal one.
+    overlayCourtListenerKey(
+        apiKeys,
+        await readCourtListenerConnection({ userId, orgId }, db),
+    );
     overlayKeyRows(apiKeys, await loadKeyRows(orgKeyOwner(orgId), db));
     return apiKeys;
 }
@@ -732,4 +728,121 @@ export async function updateApiKeySettings(
         .select("provider");
     if (error) throw error;
     return (data ?? []).length > 0;
+}
+
+// ---------------------------------------------------------------------------
+// CourtListener is a connector, so a person's own token belongs to one
+// workspace (user_courtlistener_connections, 20261022_01) rather than sitting
+// with their provider keys. An organization's token stays in org_api_keys and
+// is laid over the member's like any of its keys. The table shares this
+// file's encryption.
+// ---------------------------------------------------------------------------
+
+export type CourtListenerConnection = {
+    /** The on/off switch; on until the person turns it off. */
+    enabled: boolean;
+    /** The person's own token for the workspace. */
+    token: string | null;
+};
+
+const WITHOUT_COURTLISTENER: CourtListenerConnection = {
+    enabled: true,
+    token: null,
+};
+
+type CourtListenerRow = {
+    enabled: boolean | null;
+    encrypted_key: string | null;
+    iv: string | null;
+    auth_tag: string | null;
+};
+
+/**
+ * "unmigrated" until 20261022_01 lands: the token is then still a
+ * user_api_keys row, and the overlays below leave whatever it gave alone.
+ */
+async function readCourtListenerConnection(
+    owner: ConnectorOwner,
+    db: Db,
+): Promise<CourtListenerConnection | "unmigrated"> {
+    const { data, error } = await db
+        .from("user_courtlistener_connections")
+        .select("enabled, encrypted_key, iv, auth_tag")
+        .eq("user_id", owner.userId)
+        .filter(...workspaceFilter(owner))
+        .maybeSingle();
+    if (error) {
+        if (isMissingOrgKeySchema(error)) return "unmigrated";
+        throw error;
+    }
+    const row = data as CourtListenerRow | null;
+    if (!row) return WITHOUT_COURTLISTENER;
+    return {
+        enabled: row.enabled !== false,
+        token:
+            row.encrypted_key && row.iv && row.auth_tag
+                ? decrypt({
+                      provider: "courtlistener",
+                      encrypted_key: row.encrypted_key,
+                      iv: row.iv,
+                      auth_tag: row.auth_tag,
+                  })?.trim() || null
+                : null,
+    };
+}
+
+export async function loadCourtListenerConnection(
+    owner: ConnectorOwner,
+    db: Db = createServerSupabase(),
+): Promise<CourtListenerConnection> {
+    const connection = await readCourtListenerConnection(owner, db);
+    return connection === "unmigrated" ? WITHOUT_COURTLISTENER : connection;
+}
+
+/**
+ * Change `owner`'s switch, token, or both, creating their connection for
+ * the workspace on first use. A null or blank token removes theirs.
+ */
+export async function saveCourtListenerConnection(
+    owner: ConnectorOwner,
+    patch: { enabled?: boolean; token?: string | null },
+    db: Db = createServerSupabase(),
+): Promise<void> {
+    const row: Record<string, unknown> = {
+        user_id: owner.userId,
+        org_id: owner.orgId,
+        updated_at: new Date().toISOString(),
+    };
+    if (typeof patch.enabled === "boolean") row.enabled = patch.enabled;
+    if (patch.token !== undefined) {
+        const token = patch.token?.trim() || null;
+        if (token) {
+            const { encrypted_key, iv, auth_tag } = encrypt(token);
+            Object.assign(row, { encrypted_key, iv, auth_tag });
+        } else {
+            Object.assign(row, { encrypted_key: null, iv: null, auth_tag: null });
+        }
+    }
+    const { error } = await db
+        .from("user_courtlistener_connections")
+        .upsert(row, { onConflict: "user_id,org_id" });
+    if (error) throw error;
+}
+
+function overlayCourtListenerKey(
+    apiKeys: UserApiKeys,
+    connection: CourtListenerConnection | "unmigrated",
+): void {
+    if (connection === "unmigrated") return;
+    apiKeys.courtlistener = connection.token;
+}
+
+function overlayCourtListenerStatus(
+    status: ApiKeyStatus,
+    connection: CourtListenerConnection | "unmigrated",
+): void {
+    if (connection === "unmigrated") return;
+    status.courtlistener = !!connection.token;
+    status.sources.courtlistener = connection.token ? "user" : null;
+    delete status.enabled.courtlistener;
 }
